@@ -20,6 +20,24 @@ from PySide6.QtWidgets import (
 from v4l2 import TYPE_BOOL, TYPE_MENU, V4L2Device
 
 MAX_ZOOM = 8.0
+MICROSCOPE_USB_ID = "05e3:f12b"
+
+
+def list_cameras():
+    """Video capture nodes as (path, label, usb_id). Skips metadata nodes (index > 0)."""
+    cameras = []
+    for node in sorted(glob.glob("/sys/class/video4linux/video*"), key=lambda p: int(p.rsplit("video", 1)[1])):
+        node = Path(node)
+        if (node / "index").read_text().strip() != "0":
+            continue
+        usb = node / "device" / ".."
+        try:
+            usb_id = f"{(usb / 'idVendor').read_text().strip()}:{(usb / 'idProduct').read_text().strip()}"
+        except OSError:
+            usb_id = ""
+        path = f"/dev/{node.name}"
+        cameras.append((path, f"{(node / 'name').read_text().split(':')[0].strip()}  ({path})", usb_id))
+    return cameras
 
 
 class CameraThread(QThread):
@@ -69,6 +87,10 @@ class VideoView(QWidget):
         h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         self.image = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        self.update()
+
+    def clear(self):
+        self.image = None
         self.update()
 
     def set_zoom(self, zoom, anchor=None):
@@ -218,14 +240,16 @@ class MainWindow(QMainWindow):
         self.frame_times = []
 
         self.view = VideoView()
-        self.device = V4L2Device(device_path)
+        self.camera = None
+        self.device = None
+        self.settings = None
 
         panel = QWidget()
-        side = QVBoxLayout(panel)
-        side.addWidget(self._capture_box())
-        side.addWidget(self._zoom_box())
-        side.addWidget(CameraSettings(self.device))
-        side.addStretch()
+        self.side = QVBoxLayout(panel)
+        self.side.addWidget(self._device_box())
+        self.side.addWidget(self._capture_box())
+        self.side.addWidget(self._zoom_box())
+        self.side.addStretch()
         scroll = QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
@@ -242,11 +266,69 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.info)
         self.statusBar().showMessage("Wheel: zoom   Drag: pan   Double-click: fit   F: full screen")
         self._shortcuts()
+        self.refresh_devices(prefer=device_path)
 
-        self.camera = CameraThread(device_path)
+    def _device_box(self):
+        box = QGroupBox("Device")
+        lay = QHBoxLayout(box)
+        self.device_combo = QComboBox()
+        self.device_combo.currentIndexChanged.connect(lambda _i: self.open_device(self.device_combo.currentData()))
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(lambda: self.refresh_devices(prefer=self.device_combo.currentData()))
+        lay.addWidget(self.device_combo, 1)
+        lay.addWidget(refresh)
+        return box
+
+    def refresh_devices(self, prefer=None):
+        """Fill the device list. Keep `prefer` if present, else pick the microscope, else the first camera."""
+        cameras = list_cameras()
+        paths = [c[0] for c in cameras]
+        if prefer not in paths:
+            prefer = next((c[0] for c in cameras if c[2] == MICROSCOPE_USB_ID), paths[0] if paths else None)
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        for path, label, usb_id in cameras:
+            self.device_combo.addItem(("🔬 " if usb_id == MICROSCOPE_USB_ID else "") + label, path)
+        self.device_combo.setCurrentIndex(max(0, paths.index(prefer)) if prefer else -1)
+        self.device_combo.blockSignals(False)
+        if prefer != (self.camera.device if self.camera else None) or not (self.camera and self.camera.isRunning()):
+            self.open_device(prefer)
+        if not cameras:
+            self.statusBar().showMessage("No camera found. Connect the microscope and press Refresh.")
+
+    def open_device(self, path):
+        self.close_device()
+        if not path:
+            return
+        try:
+            self.device = V4L2Device(path)
+        except OSError as e:
+            self.statusBar().showMessage(f"Cannot open {path}: {e.strerror}")
+            return
+        self.settings = CameraSettings(self.device)
+        self.side.insertWidget(self.side.count() - 1, self.settings)
+        self.camera = CameraThread(path)
         self.camera.frame_ready.connect(self._on_frame)
         self.camera.failed.connect(self.statusBar().showMessage)
         self.camera.start()
+        self.statusBar().showMessage(f"Connected to {path}", 3000)
+
+    def close_device(self):
+        if self.writer:
+            self.toggle_record(False)
+        if self.camera:
+            self.camera.frame_ready.disconnect()  # Drop frames still queued from the old device.
+            self.camera.stop()
+            self.camera = None
+        if self.settings:
+            self.settings.deleteLater()
+            self.settings = None
+        if self.device:
+            self.device.close()
+            self.device = None
+        self.frame = None
+        self.view.clear()
+        self.info.setText("")
 
     def _capture_box(self):
         box = QGroupBox("Capture")
@@ -379,29 +461,18 @@ class MainWindow(QMainWindow):
         self.rec_btn.setStyleSheet("")
 
     def closeEvent(self, event):
-        self.camera.stop()
-        if self.writer:
-            self.writer.release()
-        self.device.close()
+        self.close_device()
         event.accept()
-
-
-def find_microscope():
-    """First video device named like the microscope, else /dev/video0."""
-    for path in sorted(glob.glob("/sys/class/video4linux/video*")):
-        if Path(path, "name").read_text().strip().startswith("USB 2.0 Camera"):
-            return "/dev/" + Path(path).name
-    return "/dev/video0"
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--device", default=None, help="video device, default: auto-detect")
+    ap.add_argument("--device", default=None, help="video device to select at start, default: the microscope")
     ap.add_argument("--out", type=Path, default=Path.home() / "Pictures" / "microscope")
     args = ap.parse_args()
 
     app = QApplication(sys.argv)
-    win = MainWindow(args.device or find_microscope(), args.out)
+    win = MainWindow(args.device, args.out)
     win.resize(1280, 760)
     win.show()
     sys.exit(app.exec())
