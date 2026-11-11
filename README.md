@@ -8,6 +8,8 @@ Native Linux app for the Genesys 05e3:f12b USB microscope (`/dev/video2`).
 ## Run
     .venv/bin/python microscope.py [--device /dev/video2] [--out ~/Pictures/microscope]
 
-The "Controls" window has sliders for all hardware V4L2 controls.
-Keys: s/space snapshot, r record, +/- zoom, arrows pan, 0 reset zoom, c reset controls, q quit.
+One window: live view on the left, capture, digital zoom and camera settings on the right.
+The app finds the microscope automatically.
+Keys: Space snapshot, R record, +/- zoom, 0 fit, F full screen, Ctrl+Q quit.
+Mouse: wheel zooms at the cursor, drag pans, double-click fits.
 Light and optical zoom are hardware-only. The snap button sends no event to Linux.
