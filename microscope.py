@@ -10,7 +10,9 @@ import struct
 import time
 from pathlib import Path
 
-import cv2
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
+
+import cv2  # noqa: E402
 
 # V4L2 ioctl numbers and struct layouts (linux/videodev2.h).
 VIDIOC_QUERYCTRL = 0xC0445624
@@ -98,6 +100,13 @@ def reset_controls(ctrls):
         cv2.setTrackbarPos(c["name"], PANEL, c["default"] - c["min"])
 
 
+def window_closed():
+    try:
+        return cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return False  # Qt backend not ready yet.
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", default="/dev/video2")
@@ -142,7 +151,7 @@ def main():
 
         key = cv2.waitKeyEx(1)
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        if key in (ord("q"), 27) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+        if key in (ord("q"), 27) or window_closed():
             break
         elif key in (ord("s"), ord(" ")):
             path = args.out / f"snap-{stamp}.png"
